@@ -99,7 +99,7 @@ func (p *Plugin) Exec() error { // nolint:funlen
 			}
 			if len(buildTools) > 0 {
 				toolDetected = true
-				p.logger.Log("msg", "build tools detected: "+strings.Join(buildTools, ", ")) //nolint: errcheck
+				p.logger.Log("msg", "build tools detected: "+strings.Join(buildTools, ",")) //nolint: errcheck
 			} else if pathOverridden {
 				p.logger.Log("msg", "using provided cache path") //nolint: errcheck
 			} else {
@@ -166,7 +166,7 @@ func (p *Plugin) Exec() error { // nolint:funlen
 	}
 
 	options = append(options, cache.WithOverride(p.Config.Override),
-		cache.WithFailRestoreIfKeyNotPresent(p.Config.FailRestoreIfKeyNotPresent), 
+		cache.WithFailRestoreIfKeyNotPresent(p.Config.FailRestoreIfKeyNotPresent),
 		cache.WithEnableCacheKeySeparator(p.Config.EnableCacheKeySeparator),
 		cache.WithStrictKeyMatching(p.Config.StrictKeyMatching))
 
@@ -185,11 +185,15 @@ func (p *Plugin) Exec() error { // nolint:funlen
 	}
 
 	// 3. Initialize cache.
+	// Determine if we should preserve metadata based on backend and flag
+	preserveMetadata := cfg.PreserveMetadata && (cfg.Backend == "s3" || cfg.Backend == "gcs")
+
 	c := cache.New(p.logger,
 		storage.New(p.logger, b, cfg.StorageOperationTimeout),
 		archive.FromFormat(p.logger, localRoot, cfg.ArchiveFormat,
 			archive.WithSkipSymlinks(cfg.SkipSymlinks),
 			archive.WithCompressionLevel(cfg.CompressionLevel),
+			archive.WithPreserveMetadata(preserveMetadata), // Pass the preserveMetadata option
 		),
 		generator,
 		cfg.Backend,
