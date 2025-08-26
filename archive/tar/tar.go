@@ -7,7 +7,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -28,13 +31,19 @@ var (
 type Archive struct {
 	logger log.Logger
 
-	root         string
-	skipSymlinks bool
+	root            string
+	skipSymlinks    bool
+	preserveMetadata bool // Add this line
 }
 
 // New creates an archive that uses the .tar file format.
 func New(logger log.Logger, root string, skipSymlinks bool) *Archive {
-	return &Archive{logger, root, skipSymlinks}
+	return &Archive{logger, root, skipSymlinks, false} // Add false for preserveMetadata
+}
+
+// NewWithPreserveMetadata creates an archive that uses the .tar file format with metadata preservation.
+func NewWithPreserveMetadata(logger log.Logger, root string, skipSymlinks bool, preserveMetadata bool) *Archive {
+	return &Archive{logger, root, skipSymlinks, preserveMetadata}
 }
 
 // Create writes content of the given source to an archive, returns written bytes.
@@ -52,7 +61,7 @@ func (a *Archive) Create(srcs []string, w io.Writer, isRelativePath bool) (int64
 			return written, fmt.Errorf("make sure file or directory readable <%s>: %v,, %w", src, err, ErrSourceNotReachable)
 		}
 
-		if err := filepath.Walk(src, writeToArchive(tw, a.root, a.skipSymlinks, &written, isRelativePath, a.logger)); err != nil {
+		if err := filepath.Walk(src, writeToArchive(tw, a.root, a.skipSymlinks, &written, isRelativePath, a.logger, a.preserveMetadata)); err != nil {
 			return written, fmt.Errorf("walk, add all files to archive, %w", err)
 		}
 	}
@@ -61,7 +70,7 @@ func (a *Archive) Create(srcs []string, w io.Writer, isRelativePath bool) (int64
 }
 
 // nolint: lll
-func writeToArchive(tw *tar.Writer, root string, skipSymlinks bool, written *int64, isRelativePath bool, logger log.Logger) func(string, os.FileInfo, error) error {
+func writeToArchive(tw *tar.Writer, root string, skipSymlinks bool, written *int64, isRelativePath bool, logger log.Logger, preserveMetadata bool) func(string, os.FileInfo, error) error {
 	return func(path string, fi os.FileInfo, err error) error {
 		level.Debug(logger).Log("path", path, "root", root) //nolint: errcheck
 
@@ -77,6 +86,21 @@ func writeToArchive(tw *tar.Writer, root string, skipSymlinks bool, written *int
 		h, err := tar.FileInfoHeader(fi, fi.Name())
 		if err != nil {
 			return fmt.Errorf("create header for <%s>, %w", path, err)
+		}
+
+		if preserveMetadata {
+			h.Format = tar.FormatPAX
+			if runtime.GOOS != "windows" {
+				if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+					h.Uid = int(stat.Uid)
+					h.Gid = int(stat.Gid)
+					// For AccessTime and ChangeTime, we'll need to extract them from Stat_t
+					// This will require platform-specific code.
+					// For now, we'll just use ModTime for both, which is a safe fallback.
+					h.AccessTime = fi.ModTime()
+					h.ChangeTime = fi.ModTime()
+				}
+			}
 		}
 
 		if fi.Mode()&os.ModeSymlink != 0 { // isSymbolic
@@ -182,11 +206,46 @@ func (a *Archive) Extract(dst string, r io.Reader) (int64, error) {
 		tr      = tar.NewReader(r)
 	)
 
+	// Map to store directory metadata for delayed restoration
+	dirMetadata := make(map[string]struct {
+		mode os.FileMode
+		at   time.Time
+		mt   time.Time
+		uid  int
+		gid  int
+	})
+
 	for {
 		h, err := tr.Next()
 
 		switch {
 		case err == io.EOF: // if no more files are found return
+			// Apply metadata to directories in reverse depth order
+			if a.preserveMetadata {
+				// Sort directories by depth (deepest first)
+				dirs := make([]string, 0, len(dirMetadata))
+				for dir := range dirMetadata {
+					dirs = append(dirs, dir)
+				}
+				// Simple sort by length of path (deepest first) - this is a heuristic
+				// A more robust solution would use filepath.Walk or build a proper tree
+				for i := 0; i < len(dirs); i++ {
+					for j := i + 1; j < len(dirs); j++ {
+						if len(dirs[i]) < len(dirs[j]) {
+							dirs[i], dirs[j] = dirs[j], dirs[i]
+						}
+					}
+				}
+
+				for _, dir := range dirs {
+					meta := dirMetadata[dir]
+					_ = os.Chmod(dir, meta.mode)
+					_ = os.Chtimes(dir, meta.at, meta.mt)
+					if runtime.GOOS != "windows" {
+						_ = os.Chown(dir, meta.uid, meta.gid) // Ignore errors (e.g., EPERM)
+					}
+				}
+			}
 			return written, nil
 		case err != nil: // return any other error
 			return written, fmt.Errorf("tar reader <%v>, %w", err, ErrArchiveNotReadable)
@@ -214,13 +273,33 @@ func (a *Archive) Extract(dst string, r io.Reader) (int64, error) {
 
 		switch h.Typeflag {
 		case tar.TypeDir:
-			if err := extractDir(h, target); err != nil {
-				return written, err
+			if a.preserveMetadata {
+				// Store metadata for later application
+				dirMetadata[target] = struct {
+					mode os.FileMode
+					at   time.Time
+					mt   time.Time
+					uid  int
+					gid  int
+				}{
+					mode: os.FileMode(h.Mode),
+					at:   h.AccessTime,
+					mt:   h.ModTime,
+					uid:  h.Uid,
+					gid:  h.Gid,
+				}
+				// Create the directory with default permissions for now
+				if err := os.MkdirAll(target, defaultDirPermission); err != nil {
+					return written, fmt.Errorf("create directory <%s>, %w", target, err)
+				}
+			} else {
+				if err := extractDir(h, target); err != nil {
+					return written, err
+				}
 			}
-
 			continue
 		case tar.TypeReg, tar.TypeRegA, tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
-			n, err := extractRegular(h, tr, target)
+			n, err := extractRegular(h, tr, target, a.preserveMetadata)
 			written += n
 
 			if err != nil {
@@ -229,13 +308,13 @@ func (a *Archive) Extract(dst string, r io.Reader) (int64, error) {
 
 			continue
 		case tar.TypeSymlink:
-			if err := extractSymlink(h, target); err != nil {
+			if err := extractSymlink(h, target, a.preserveMetadata); err != nil {
 				return written, fmt.Errorf("extract symbolic link, %w", err)
 			}
 
 			continue
 		case tar.TypeLink:
-			if err := extractLink(h, target); err != nil {
+			if err := extractLink(h, target, a.preserveMetadata); err != nil {
 				return written, fmt.Errorf("extract link, %w", err)
 			}
 
@@ -256,7 +335,7 @@ func extractDir(h *tar.Header, target string) error {
 	return nil
 }
 
-func extractRegular(h *tar.Header, tr io.Reader, target string) (n int64, err error) {
+func extractRegular(h *tar.Header, tr io.Reader, target string, preserveMetadata bool) (n int64, err error) {
 	f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(h.Mode))
 	if err != nil {
 		return 0, fmt.Errorf("open extracted file for writing <%s>, %w", target, err)
@@ -269,10 +348,23 @@ func extractRegular(h *tar.Header, tr io.Reader, target string) (n int64, err er
 		return written, fmt.Errorf("copy extracted file for writing <%s>, %w", target, err)
 	}
 
+	// Apply metadata if preserveMetadata is enabled
+	if preserveMetadata {
+		_ = os.Chmod(target, os.FileMode(h.Mode))
+		at := h.AccessTime
+		if at.IsZero() {
+			at = h.ModTime
+		}
+		_ = os.Chtimes(target, at, h.ModTime)
+		if runtime.GOOS != "windows" {
+			_ = os.Chown(target, h.Uid, h.Gid) // Ignore errors (e.g., EPERM)
+		}
+	}
+
 	return written, nil
 }
 
-func extractSymlink(h *tar.Header, target string) error {
+func extractSymlink(h *tar.Header, target string, preserveMetadata bool) error {
 	if err := unlink(target); err != nil {
 		return fmt.Errorf("unlink <%s>, %w", target, err)
 	}
@@ -281,16 +373,34 @@ func extractSymlink(h *tar.Header, target string) error {
 		return fmt.Errorf("create symbolic link <%s>, %w", target, err)
 	}
 
+	// Apply ownership if preserveMetadata is enabled (Unix only)
+	if preserveMetadata && runtime.GOOS != "windows" {
+		_ = os.Lchown(target, h.Uid, h.Gid) // Ignore errors (e.g., EPERM)
+	}
+
 	return nil
 }
 
-func extractLink(h *tar.Header, target string) error {
+func extractLink(h *tar.Header, target string, preserveMetadata bool) error {
 	if err := unlink(target); err != nil {
 		return fmt.Errorf("unlink <%s>, %w", target, err)
 	}
 
 	if err := os.Link(h.Linkname, target); err != nil {
 		return fmt.Errorf("create hard link <%s>, %w", h.Linkname, err)
+	}
+
+	// Apply metadata if preserveMetadata is enabled
+	if preserveMetadata {
+		_ = os.Chmod(target, os.FileMode(h.Mode))
+		at := h.AccessTime
+		if at.IsZero() {
+			at = h.ModTime
+		}
+		_ = os.Chtimes(target, at, h.ModTime)
+		if runtime.GOOS != "windows" {
+			_ = os.Chown(target, h.Uid, h.Gid) // Ignore errors (e.g., EPERM)
+		}
 	}
 
 	return nil

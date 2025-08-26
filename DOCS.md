@@ -314,6 +314,53 @@ steps:
       debug: true
 ```
 
+**With metadata preservation**
+
+```yaml
+kind: pipeline
+name: default
+
+steps:
+  - name: restore-cache-with-metadata
+    image: meltwater/drone-cache:dev
+    environment:
+      AWS_ACCESS_KEY_ID:
+        from_secret: aws_access_key_id
+      AWS_SECRET_ACCESS_KEY:
+        from_secret: aws_secret_access_key
+    pull: true
+    settings:
+      restore: true
+      preserve_metadata: true
+      bucket: drone-cache-bucket
+      region: eu-west-1
+      mount:
+        - 'vendor'
+
+  - name: build
+    image: golang:1.22.4-alpine3.19
+    pull: true
+    commands:
+      - apk add --update make git
+      - make drone-cache
+
+  - name: rebuild-cache-with-metadata
+    image: meltwater/drone-cache:dev
+    pull: true
+    environment:
+      AWS_ACCESS_KEY_ID:
+        from_secret: aws_access_key_id
+      AWS_SECRET_ACCESS_KEY:
+        from_secret: aws_secret_access_key
+    settings:
+      rebuild: true
+      preserve_metadata: true
+      bucket: drone-cache-bucket
+      region: eu-west-1
+      mount:
+        - 'vendor'
+```
+
 # Parameter Reference
 
 backend
@@ -378,3 +425,6 @@ encryption
 
 skip_symlinks
 : skip symbolic links in archive
+
+preserve_metadata
+: preserve metadata (permissions, ownership, timestamps) (default: `false`)
