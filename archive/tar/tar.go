@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -28,13 +29,14 @@ var (
 type Archive struct {
 	logger log.Logger
 
-	root         string
-	skipSymlinks bool
+	root             string
+	skipSymlinks     bool
+	preserveMetadata bool
 }
 
 // New creates an archive that uses the .tar file format.
-func New(logger log.Logger, root string, skipSymlinks bool) *Archive {
-	return &Archive{logger, root, skipSymlinks}
+func New(logger log.Logger, root string, skipSymlinks bool, preserveMetadata bool) *Archive {
+	return &Archive{logger, root, skipSymlinks, preserveMetadata}
 }
 
 // Create writes content of the given source to an archive, returns written bytes.
@@ -52,7 +54,7 @@ func (a *Archive) Create(srcs []string, w io.Writer, isRelativePath bool) (int64
 			return written, fmt.Errorf("make sure file or directory readable <%s>: %v,, %w", src, err, ErrSourceNotReachable)
 		}
 
-		if err := filepath.Walk(src, writeToArchive(tw, a.root, a.skipSymlinks, &written, isRelativePath, a.logger)); err != nil {
+		if err := filepath.Walk(src, writeToArchive(tw, a.root, a.skipSymlinks, a.preserveMetadata, &written, isRelativePath, a.logger)); err != nil {
 			return written, fmt.Errorf("walk, add all files to archive, %w", err)
 		}
 	}
@@ -61,7 +63,7 @@ func (a *Archive) Create(srcs []string, w io.Writer, isRelativePath bool) (int64
 }
 
 // nolint: lll
-func writeToArchive(tw *tar.Writer, root string, skipSymlinks bool, written *int64, isRelativePath bool, logger log.Logger) func(string, os.FileInfo, error) error {
+func writeToArchive(tw *tar.Writer, root string, skipSymlinks bool, preserveMetadata bool, written *int64, isRelativePath bool, logger log.Logger) func(string, os.FileInfo, error) error {
 	return func(path string, fi os.FileInfo, err error) error {
 		level.Debug(logger).Log("path", path, "root", root) //nolint: errcheck
 
@@ -104,6 +106,26 @@ func writeToArchive(tw *tar.Writer, root string, skipSymlinks bool, written *int
 		}
 
 		h.Name = name
+
+		// Populate metadata if preserveMetadata is enabled
+		if preserveMetadata {
+			// Set PAX format to support extended attributes
+			h.Format = tar.FormatPAX
+			
+			// Platform-specific metadata population
+			if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+				// On Unix: populate uid/gid from syscall.Stat_t
+				h.Uid = int(stat.Uid)
+				h.Gid = int(stat.Gid)
+				
+				// Extract extended timestamps using statTimes helper
+				if atime, ctime, ok := statTimes(fi); ok {
+					h.AccessTime = atime
+					h.ChangeTime = ctime
+				}
+			}
+			// On Windows: uid/gid remain zero (default), no atime/ctime population
+		}
 
 		if err := tw.WriteHeader(h); err != nil {
 			return fmt.Errorf("write header for <%s>, %w", path, err)

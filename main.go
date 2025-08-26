@@ -314,6 +314,12 @@ func main() {
 			EnvVars: []string{"PLUGIN_SKIP_SYMLINKS", "SKIP_SYMLINKS"},
 		},
 		&cli.BoolFlag{
+			Name:    "preserve-metadata, pm",
+			Usage:   "preserve file metadata (permissions, ownership, timestamps) in cache archives",
+			Value:   false,
+			EnvVars: []string{"PLUGIN_PRESERVE_METADATA"},
+		},
+		&cli.BoolFlag{
 			Name:    "debug, d",
 			Usage:   "debug",
 			EnvVars: []string{"PLUGIN_DEBUG", "DEBUG"},
@@ -731,7 +737,8 @@ func run(c *cli.Context) error {
 			MultipartEnabled:       c.String("multipart.enabled"),
 		},
 
-		SkipSymlinks: c.Bool("skip-symlinks"),
+		SkipSymlinks:     c.Bool("skip-symlinks"),
+		PreserveMetadata: c.Bool("preserve-metadata"),
 	}
 
 	err := plg.Exec()
