@@ -185,12 +185,18 @@ func (p *Plugin) Exec() error { // nolint:funlen
 	}
 
 	// 3. Initialize cache.
+	var archiveOptions []archive.Option
+	archiveOptions = append(archiveOptions, archive.WithSkipSymlinks(cfg.SkipSymlinks))
+	archiveOptions = append(archiveOptions, archive.WithCompressionLevel(cfg.CompressionLevel))
+	
+	// Only enable preserve metadata for S3 and GCS backends when flag is set
+	if cfg.PreserveMetadata && (cfg.Backend == backend.S3 || cfg.Backend == backend.GCS) {
+		archiveOptions = append(archiveOptions, archive.WithPreserveMetadata(true))
+	}
+	
 	c := cache.New(p.logger,
 		storage.New(p.logger, b, cfg.StorageOperationTimeout),
-		archive.FromFormat(p.logger, localRoot, cfg.ArchiveFormat,
-			archive.WithSkipSymlinks(cfg.SkipSymlinks),
-			archive.WithCompressionLevel(cfg.CompressionLevel),
-		),
+		archive.FromFormat(p.logger, localRoot, cfg.ArchiveFormat, archiveOptions...),
 		generator,
 		cfg.Backend,
 		cfg.AccountID,

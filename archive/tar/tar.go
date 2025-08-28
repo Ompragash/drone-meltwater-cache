@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -28,13 +30,19 @@ var (
 type Archive struct {
 	logger log.Logger
 
-	root         string
-	skipSymlinks bool
+	root             string
+	skipSymlinks     bool
+	preserveMetadata bool
 }
 
 // New creates an archive that uses the .tar file format.
 func New(logger log.Logger, root string, skipSymlinks bool) *Archive {
-	return &Archive{logger, root, skipSymlinks}
+	return &Archive{logger, root, skipSymlinks, false}
+}
+
+// NewWithOptions creates an archive that uses the .tar file format with additional options.
+func NewWithOptions(logger log.Logger, root string, skipSymlinks, preserveMetadata bool) *Archive {
+	return &Archive{logger, root, skipSymlinks, preserveMetadata}
 }
 
 // Create writes content of the given source to an archive, returns written bytes.
@@ -52,7 +60,7 @@ func (a *Archive) Create(srcs []string, w io.Writer, isRelativePath bool) (int64
 			return written, fmt.Errorf("make sure file or directory readable <%s>: %v,, %w", src, err, ErrSourceNotReachable)
 		}
 
-		if err := filepath.Walk(src, writeToArchive(tw, a.root, a.skipSymlinks, &written, isRelativePath, a.logger)); err != nil {
+		if err := filepath.Walk(src, writeToArchive(tw, a.root, a.skipSymlinks, a.preserveMetadata, &written, isRelativePath, a.logger)); err != nil {
 			return written, fmt.Errorf("walk, add all files to archive, %w", err)
 		}
 	}
@@ -61,7 +69,7 @@ func (a *Archive) Create(srcs []string, w io.Writer, isRelativePath bool) (int64
 }
 
 // nolint: lll
-func writeToArchive(tw *tar.Writer, root string, skipSymlinks bool, written *int64, isRelativePath bool, logger log.Logger) func(string, os.FileInfo, error) error {
+func writeToArchive(tw *tar.Writer, root string, skipSymlinks, preserveMetadata bool, written *int64, isRelativePath bool, logger log.Logger) func(string, os.FileInfo, error) error {
 	return func(path string, fi os.FileInfo, err error) error {
 		level.Debug(logger).Log("path", path, "root", root) //nolint: errcheck
 
@@ -77,6 +85,21 @@ func writeToArchive(tw *tar.Writer, root string, skipSymlinks bool, written *int
 		h, err := tar.FileInfoHeader(fi, fi.Name())
 		if err != nil {
 			return fmt.Errorf("create header for <%s>, %w", path, err)
+		}
+
+		// If preserveMetadata is enabled, enhance the header with additional metadata
+		if preserveMetadata {
+			h.Format = tar.FormatPAX
+			
+			// Set UID/GID
+			h.Uid = getUID(fi)
+			h.Gid = getGID(fi)
+			
+			// Set access time and change time if available
+			if atime, ctime, ok := statTimes(fi); ok {
+				h.AccessTime = atime
+				h.ChangeTime = ctime
+			}
 		}
 
 		if fi.Mode()&os.ModeSymlink != 0 { // isSymbolic
@@ -175,18 +198,31 @@ func writeFileToArchive(tw io.Writer, path string) (n int64, err error) {
 	return written, nil
 }
 
+// dirMetadata holds metadata for a directory to be applied after extraction
+type dirMetadata struct {
+	mode  os.FileMode
+	atime time.Time
+	mtime time.Time
+	uid   int
+	gid   int
+}
+
 // Extract reads content from the given archive reader and restores it to the destination, returns written bytes.
 func (a *Archive) Extract(dst string, r io.Reader) (int64, error) {
 	var (
-		written int64
-		tr      = tar.NewReader(r)
+		written     int64
+		tr          = tar.NewReader(r)
+		dirMetaMap  = make(map[string]dirMetadata) // Map to store directory metadata for delayed application
 	)
 
 	for {
 		h, err := tr.Next()
 
 		switch {
-		case err == io.EOF: // if no more files are found return
+		case err == io.EOF: // if no more files are found, apply delayed directory metadata and return
+			if a.preserveMetadata {
+				a.applyDelayedDirMetadata(dirMetaMap)
+			}
 			return written, nil
 		case err != nil: // return any other error
 			return written, fmt.Errorf("tar reader <%v>, %w", err, ErrArchiveNotReadable)
@@ -218,6 +254,21 @@ func (a *Archive) Extract(dst string, r io.Reader) (int64, error) {
 				return written, err
 			}
 
+			// Store directory metadata for delayed application if preserveMetadata is enabled
+			if a.preserveMetadata {
+				atime := h.ModTime
+				if !h.AccessTime.IsZero() {
+					atime = h.AccessTime
+				}
+				dirMetaMap[target] = dirMetadata{
+					mode:  os.FileMode(h.Mode),
+					atime: atime,
+					mtime: h.ModTime,
+					uid:   h.Uid,
+					gid:   h.Gid,
+				}
+			}
+
 			continue
 		case tar.TypeReg, tar.TypeRegA, tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
 			n, err := extractRegular(h, tr, target)
@@ -227,10 +278,20 @@ func (a *Archive) Extract(dst string, r io.Reader) (int64, error) {
 				return written, fmt.Errorf("extract regular file, %w", err)
 			}
 
+			// Apply file metadata if preserveMetadata is enabled
+			if a.preserveMetadata {
+				applyFileMetadata(target, h)
+			}
+
 			continue
 		case tar.TypeSymlink:
 			if err := extractSymlink(h, target); err != nil {
 				return written, fmt.Errorf("extract symbolic link, %w", err)
+			}
+
+			// Apply symlink metadata if preserveMetadata is enabled
+			if a.preserveMetadata {
+				applySymlinkMetadata(target, h)
 			}
 
 			continue
@@ -303,4 +364,25 @@ func unlink(path string) error {
 	}
 
 	return nil
+}
+
+// applyDelayedDirMetadata applies directory metadata in reverse depth order (deepest first)
+// to avoid having child file creation modify parent directory timestamps
+func (a *Archive) applyDelayedDirMetadata(dirMetaMap map[string]dirMetadata) {
+	// Sort directories by depth (deepest first)
+	var dirs []string
+	for dir := range dirMetaMap {
+		dirs = append(dirs, dir)
+	}
+	
+	// Sort by depth (number of path separators), deepest first
+	sort.Slice(dirs, func(i, j int) bool {
+		return strings.Count(dirs[i], string(filepath.Separator)) > strings.Count(dirs[j], string(filepath.Separator))
+	})
+	
+	// Apply metadata to each directory
+	for _, dir := range dirs {
+		meta := dirMetaMap[dir]
+		applyDirMetadata(dir, meta.mode, meta.atime, meta.mtime, meta.uid, meta.gid)
+	}
 }
